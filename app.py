@@ -4,6 +4,7 @@ import pandas as pd
 import pdfplumber
 import re
 import io
+import os
 
 st.set_page_config(page_title="Salary Scale Comparator", layout="wide")
 
@@ -40,7 +41,8 @@ def parse_pdf_with_geometry(pdf_file):
         text_line = " ".join([w['text'] for w in row_words])
         
         # Stop processing if we hit the July table
-        if "De salaristabel is per 1 juli" in text_line.lower():
+        # User reported July table leak. We use stronger check.
+        if "juli" in text_line.lower() and "2026" in text_line:
             break
 
         # Heuristic to look for the table start if usually dates are mentioned
@@ -189,20 +191,42 @@ def parse_excel_sheet(excel_file):
 
 # --- UI Layout ---
 
+# ... existing imports ...
+import os
+
+# ... existing config ...
+
+# --- UI Layout ---
+
 col1, col2 = st.columns(2)
+
+# Check for default files
+default_pdf_path = "salary-scale.pdf"
+default_excel_path = "wage-excel.xlsx"
+
+default_pdf_exists = os.path.exists(default_pdf_path)
+default_excel_exists = os.path.exists(default_excel_path)
 
 with col1:
     pdf_file = st.file_uploader("Upload PDF", type=["pdf"])
+    if not pdf_file and default_pdf_exists:
+        st.info(f"Using default: {default_pdf_path}")
 
 with col2:
     excel_file = st.file_uploader("Upload Excel", type=["xlsx"])
+    if not excel_file and default_excel_exists:
+        st.info(f"Using default: {default_excel_path}")
 
 if st.button("Compare Files"):
-    if pdf_file and excel_file:
+    # Determine files to use
+    pdf_to_process = pdf_file if pdf_file else (default_pdf_path if default_pdf_exists else None)
+    excel_to_process = excel_file if excel_file else (default_excel_path if default_excel_exists else None)
+
+    if pdf_to_process and excel_to_process:
         with st.spinner("Parsing files..."):
             try:
-                pdf_data = parse_pdf_with_geometry(pdf_file)
-                excel_data = parse_excel_sheet(excel_file)
+                pdf_data = parse_pdf_with_geometry(pdf_to_process)
+                excel_data = parse_excel_sheet(excel_to_process)
                 
                 # Comparison Logic
                 results = []
@@ -254,15 +278,10 @@ if st.button("Compare Files"):
                     st.success("✅ No Mismatches Found! (All values match or represent explained MinWage corrections)")
                 else:
                     st.warning("⚠️ Mismatches Found (Including MinWage Corrections)")
-                    
-                    # Optional: metric summary
-                    # st.dataframe(df_res, use_container_width=True)
-                    
-                    # Let's show a clean table
                     st.table(df_res)
                 
             except Exception as e:
                 st.error(f"An error occurred: {e}")
                 st.exception(e)
     else:
-        st.warning("Please upload both files to proceed.")
+        st.warning("Please upload files or ensure default files exist to proceed.")
