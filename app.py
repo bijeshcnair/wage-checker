@@ -39,10 +39,16 @@ def parse_pdf_with_geometry(pdf_file):
         row_words = sorted(lines[y], key=lambda w: w['x0'])
         text_line = " ".join([w['text'] for w in row_words])
         
+        # Stop processing if we hit the July table
+        if "De salaristabel is per 1 juli" in text_line.lower():
+            break
+
         # Heuristic to look for the table start if usually dates are mentioned
         if "De salaristabel is per" in text_line:
-            # You might want to let user choose date or default to first
-            table_active = True
+            # Check if it is January (or just enable if we haven't hit July yet)
+            if "januari" in text_line.lower():
+                table_active = True
+            continue 
             
         # Or just start if we see "Periodiek"
         if "Periodiek" in text_line:
