@@ -226,46 +226,40 @@ if st.button("Compare Files"):
                     status = "✅ Match"
                     diff = 0
                     
-                    if pdf_val is None and excel_val is None:
+                    if pdf_val is None or excel_val is None:
                         continue
-                    elif pdf_val is None:
-                        status = "⚠️ Missing in PDF"
-                        if excel_val == 2496: status = "ℹ️ MinWage Fill"
-                    elif excel_val is None:
-                        status = "⚠️ Missing in Excel"
-                    elif pdf_val != excel_val:
-                        diff = excel_val - pdf_val
-                        if excel_val == 2496 and pdf_val < 2496:
-                            status = "ℹ️ MinWage Correction"
-                        else:
-                            status = "❌ Mismatch"
+
+                    if pdf_val == excel_val:
+                        continue
+                        
+                    # It is a difference.
+                    diff = excel_val - pdf_val
+                    if excel_val == 2496 and pdf_val < 2496:
+                        status = "ℹ️ MinWage Correction"
+                    else:
+                        status = "❌ Mismatch"
                             
                     results.append({
                         "Scale": s,
                         "Period": p,
                         "PDF Value": pdf_val,
                         "Excel Value": excel_val,
-                        "Difference": diff if diff != 0 else "",
+                        "Difference": diff,
                         "Status": status
                     })
                 
                 df_res = pd.DataFrame(results)
                 
-                st.success("Comparison Complete!")
-                
-                # Summary Metrics
-                total = len(results)
-                matches = len(df_res[df_res['Status'] == "✅ Match"])
-                explained = len(df_res[df_res['Status'].str.contains("MinWage")])
-                mismatches = len(df_res[df_res['Status'] == "❌ Mismatch"])
-                
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Total Points", total)
-                m2.metric("Exact Matches", matches)
-                m3.metric("Explained (MinWage)", explained)
-                m4.metric("Mismatches", mismatches)
-                
-                st.dataframe(df_res, use_container_width=True)
+                if df_res.empty:
+                    st.success("✅ No Mismatches Found! (All values match or represent explained MinWage corrections)")
+                else:
+                    st.warning("⚠️ Mismatches Found (Including MinWage Corrections)")
+                    
+                    # Optional: metric summary
+                    # st.dataframe(df_res, use_container_width=True)
+                    
+                    # Let's show a clean table
+                    st.table(df_res)
                 
             except Exception as e:
                 st.error(f"An error occurred: {e}")
