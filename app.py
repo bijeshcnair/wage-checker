@@ -3,238 +3,266 @@ import streamlit as st
 import pandas as pd
 import pdfplumber
 import re
+import io
 
-st.set_page_config(page_title="Salary Comparator", layout="wide")
-st.title("⚖️ Salary Comparator")
+st.set_page_config(page_title="Salary Scale Comparator", layout="wide")
 
-# --- 1. PDF Parser (Returns Dict: {(period, scale): value}) ---
-def get_pdf_matrix(pdf_file):
-    matrix = {}
+st.title("📊 Salary Scale Comparator")
+st.markdown("""
+Upload your **Salary Scale PDF** and the corresponding **Excel Sheet** to compare values.
+""")
+
+# --- Parsing Logic ---
+
+def parse_pdf_with_geometry(pdf_file):
+    data = {} # (period, scale) -> value
+    
     with pdfplumber.open(pdf_file) as pdf:
-        if not pdf.pages: return {}
+        if len(pdf.pages) == 0:
+            return data
         page = pdf.pages[0]
         words = page.extract_words()
-
-    # 1. Group words by Line (Y-coordinate)
+        
+    # Cluster words into lines based on 'top' coordinate
     lines = {}
     for w in words:
         y = round(w['top'] / 2) * 2
         if y not in lines: lines[y] = []
         lines[y].append(w)
-    
+        
     sorted_y = sorted(lines.keys())
     
-    # 2. Identify Table Headers and Data
-    scale_cols = {} # {scale_name: x_center}
-    
-    table_found = False
+    scale_columns = {}
+    table_active = False
     
     for y in sorted_y:
         row_words = sorted(lines[y], key=lambda w: w['x0'])
-        text = " ".join([w['text'] for w in row_words]).lower()
+        text_line = " ".join([w['text'] for w in row_words])
         
-        # STOP processing if we reach the July table
-        if "per 1 juli" in text:
+        # Stop processing if we hit the July table
+        if "De salaristabel is per 1 juli" in text_line.lower():
             break
-            
-        # START processing if we see January
-        if "per 1 januari" in text:
-            table_found = True
-            
-        # Detect Header Row (contains "Periodiek" and numbers)
-        if "periodiek" in text:
-            # If we haven't seen the Jan title yet, this might be the Jan header anyway
-            # But if we passed July, we stopped. So this must be Jan.
-            table_found = True
-            
-            # Extract Scale Columns
-            # We look for words that are numbers (scales 1, 2... 10 etc)
-            current_scale_cols = {}
-            for w in row_words:
-                t = w['text']
-                if t.lower() == "periodiek": continue
-                # Scale names are usually numbers or 10A etc.
-                # Let's simple take everything else as a scale header
-                current_scale_cols[t] = (w['x0'] + w['x1']) / 2
-            
-            if current_scale_cols:
-                scale_cols = current_scale_cols
-            continue
 
-        if not table_found:
+        # Heuristic to look for the table start if usually dates are mentioned
+        if "De salaristabel is per" in text_line:
+            # Check if it is January (or just enable if we haven't hit July yet)
+            if "januari" in text_line.lower():
+                table_active = True
+            continue 
+            
+        # Or just start if we see "Periodiek"
+        if "Periodiek" in text_line:
+            table_active = True
+            
+            seen_periodiek = False
+            scale_columns = {} 
+            for w in row_words:
+                if "Periodiek" in w['text']:
+                    seen_periodiek = True
+                    continue
+                if seen_periodiek:
+                    scale_name = w['text']
+                    x_center = (w['x0'] + w['x1']) / 2
+                    scale_columns[scale_name] = x_center
             continue
             
-        # Process Data Rows
-        # Row must start with a number (Period)
+        if not table_active:
+            continue
+            
+        # Data Row
         if not row_words: continue
         
-        first_text = row_words[0]['text']
-        if re.match(r'^\d+$', first_text):
-            period = first_text
+        first_word = row_words[0]
+        # Period should be a number or maybe "0"
+        if re.match(r'^\d+$', first_word['text']):
+            period = first_word['text']
             
-            if not scale_cols: continue
-            
-            # Map remaining words to closest scale column
+            if not scale_columns:
+                continue
+                
             for w in row_words[1:]:
-                val_text = w['text'].replace('.','').replace(',','')
-                if not val_text.isdigit(): continue
-                val = int(val_text)
+                val_text = w['text']
+                clean_val_str = val_text.replace('.', '').replace(',', '')
+                if not clean_val_str.isdigit():
+                    continue
+                
+                val = int(clean_val_str)
+                # Skip massive numbers or tiny numbers if they look like artifacts, 
+                # but salary 2000-10000 is expected.
                 
                 w_center = (w['x0'] + w['x1']) / 2
                 
-                # Find closest scale
                 closest_scale = None
-                min_dist = 1000
+                min_dist = 9999
                 
-                for scale, x_ref in scale_cols.items():
-                    dist = abs(w_center - x_ref)
+                for scale, col_x in scale_columns.items():
+                    dist = abs(w_center - col_x)
                     if dist < min_dist:
                         min_dist = dist
                         closest_scale = scale
                 
-                # Threshold to ensure valid mapping (e.g. 50px)
-                if min_dist < 50:
-                    matrix[(period, closest_scale)] = val
-                    
-    return matrix
+                if min_dist < 50 and closest_scale:
+                    data[(period, closest_scale)] = val
 
-# --- 2. Excel Parser (Returns Dict: {(period, scale): value}) ---
-def get_excel_matrix(excel_file):
-    matrix = {}
+    return data
+
+def parse_excel_sheet(excel_file):
+    # User said 3rd sheet
     try:
-        # Read 3rd sheet (index 2)
+        # Load without header to scan
         df = pd.read_excel(excel_file, sheet_name=2, header=None)
-    except:
+    except Exception as e:
+        st.error(f"Error reading Excel sheet 3: {e}")
         return {}
-        
-    # Scan for "Periodiek" row
-    header_map = {} # {col_idx: scale_name}
-    header_row = -1
+
+    data = {}
+    
+    # Locate Header Row
+    header_row_idx = None
+    column_map = {} # col_idx -> scale_name
     
     for idx, row in df.iterrows():
-        # Convert row to string list
-        vals = [str(v).strip() for v in row.values]
+        # Look for "Periodiek"
+        row_values = [str(x).strip() for x in row.values]
         
-        if "Periodiek" in vals:
-            header_row = idx
+        if "Periodiek" in row_values:
+            # Found header candidate
             # Map columns
-            # usually Periodiek is col X, then X+1 is Scale 1, etc.
-            # Find index of Periodiek
-            try:
-                p_idx = vals.index("Periodiek")
-                # All subsequent non-empty cols are scales
-                for c in range(p_idx + 1, len(vals)):
-                    scale_name = vals[c]
-                    if scale_name and scale_name.lower() != 'nan':
-                         header_map[c] = scale_name
-            except:
+            is_collecting = False
+            for col_idx, cell_val in enumerate(row_values):
+                if cell_val == "Periodiek":
+                    is_collecting = True
+                    # The periodiek column is usually THIS one or below it? 
+                    # In the PDF logic, Periodiek was a label row.
+                    # In Excel, usually Periodiek is a column header, but here it seems "Periodiek" is a label for the scale columns row?
+                    # Let's rely on finding numbers/scales.
+                    continue
+                
+                if is_collecting and cell_val and cell_val.lower() != "nan" and cell_val != "":
+                    # likely a scale
+                    if "Salaris" not in cell_val: # Avoid "Salarisschaal" label
+                        column_map[col_idx] = cell_val
+                        
+            if column_map:
+                header_row_idx = idx
+                # st.write(f"DEBUG: Found header at row {idx} with scales: {column_map}")
+                # We assume the table continues until it ends or new header
                 pass
-            continue
+                
+        # If we have an active column map, check for data
+        if column_map and idx > header_row_idx:
+            # Check for period number in columns to the left of the first scale
+            first_scale_col = min(column_map.keys())
             
-        # Data Rows (must be after header)
-        if header_row != -1 and idx > header_row and header_map:
-            # Find Period value (usually in column p_idx)
-            # Or scan first few cols for a digit
+            # Period is likely 1 or 2 cols to the left
             period = None
             
-            # We suspect Period is in the column where "Periodiek" was, or near it.
-            # Let's search columns 0 to 5 for a digit
-            row_clean = [str(v).strip() for v in row.values]
-            
-            for i in range(len(row_clean)):
-                if row_clean[i].isdigit():
-                    period = row_clean[i]
+            # Check safely
+            for check_col in range(first_scale_col - 1, -1, -1):
+                val = str(row.iloc[check_col]).strip()
+                if val.isdigit():
+                    period = val
+                    break
+                if val and val.lower() != "nan": 
+                    # Found something non-digit non-empty, maybe stop searching
                     break
             
             if period:
-                # Extract values for mapped scales
-                for col_idx, scale in header_map.items():
-                    if col_idx < len(row):
-                        raw = row[col_idx]
-                        try:
-                            # Clean and Int
-                            val = float(raw)
-                            if val > 100: # Filter out hourly rates
-                                matrix[(period, scale)] = int(val)
-                        except:
-                            pass
-    return matrix
+                # Extract Data
+                for col_idx, scale in column_map.items():
+                    raw_val = row.iloc[col_idx]
+                    if pd.isna(raw_val): continue
+                    
+                    try:
+                        # Fix formatting if string
+                        val_str = str(raw_val).replace('.', '').replace(',', '')
+                        # Sometimes Excel reads as float 2496.0
+                        val_f = float(raw_val)
+                        # Check if it's hourly (small number)
+                        if val_f < 100: continue
+                        
+                        data[(period, scale)] = int(val_f)
+                    except:
+                        pass
 
-# --- 3. UI & Comparison ---
+    return data
+
+# --- UI Layout ---
 
 col1, col2 = st.columns(2)
-f_pdf = col1.file_uploader("Upload PDF", type='pdf')
-f_xls = col2.file_uploader("Upload Excel", type='xlsx')
 
-if f_pdf and f_xls:
-    # 1. Get Matrices
-    mat_pdf = get_pdf_matrix(f_pdf)
-    mat_xls = get_excel_matrix(f_xls)
-    
-    # 2. Compare
-    # We want to compare every intersection
-    all_periods = set([k[0] for k in mat_pdf.keys()] + [k[0] for k in mat_xls.keys()])
-    all_scales = set([k[1] for k in mat_pdf.keys()] + [k[1] for k in mat_xls.keys()])
-    
-    mismatches = []
-    
-    # Sort keys for display
-    def sort_p(p):
-        try: return int(p)
-        except: return 999
-    def sort_s(s):
-        try: return float(str(s).replace('A', '.5'))
-        except: return 999
-        
-    top_p = sorted(list(all_periods), key=sort_p)
-    top_s = sorted(list(all_scales), key=sort_s)
-    
-    for p in top_p:
-        for s in top_s:
-            key = (p, s)
-            
-            v_pdf = mat_pdf.get(key)
-            v_xls = mat_xls.get(key)
-            
-            # User Rule: "only show mismatches"
-            # Mismatch = Values exist and are different
-            # Implicit: If one is missing and the other exists, is it a mismatch?
-            # User said: "scale 1 , period 0 is empty right... and 2496 in the html... " -> This was handled as mismatch/explained earlier.
-            # We will show it if they differ.
-            
-            # Treat Missing as None
-            
-            if v_pdf == v_xls:
-                continue
+with col1:
+    pdf_file = st.file_uploader("Upload PDF", type=["pdf"])
+
+with col2:
+    excel_file = st.file_uploader("Upload Excel", type=["xlsx"])
+
+if st.button("Compare Files"):
+    if pdf_file and excel_file:
+        with st.spinner("Parsing files..."):
+            try:
+                pdf_data = parse_pdf_with_geometry(pdf_file)
+                excel_data = parse_excel_sheet(excel_file)
                 
-            # If both missing, continue
-            if v_pdf is None and v_xls is None:
-                continue
+                # Comparison Logic
+                results = []
                 
-            # Difference Found
-            status = "Mismatch"
-            
-            # Logic for MinWage
-            if v_xls == 2496:
-                if v_pdf is None:
-                    status = "MinWage Fill (PDF Empty)"
-                elif v_pdf < 2496:
-                    status = "MinWage Correction"
-            
-            # Prepare row
-            mismatches.append({
-                "Period": p,
-                "Scale": s,
-                "PDF": v_pdf,
-                "Excel": v_xls,
-                "Note": status
-            })
-            
-    # 3. Display
-    if mismatches:
-        df_out = pd.DataFrame(mismatches)
-        st.warning(f"Found {len(mismatches)} discrepancies")
-        st.table(df_out)
+                all_keys = set(pdf_data.keys()) | set(excel_data.keys())
+                
+                # Sort
+                def sort_key(k):
+                    p, s = k
+                    try: p_i = int(p)
+                    except: p_i = -1
+                    s_clean = str(s).replace('A', '.5')
+                    try: s_f = float(s_clean)
+                    except: s_f = -1.0
+                    return (s_f, p_i)
+                
+                for p, s in sorted(list(all_keys), key=sort_key):
+                    pdf_val = pdf_data.get((p, s), None)
+                    excel_val = excel_data.get((p, s), None)
+                    
+                    status = "✅ Match"
+                    diff = 0
+                    
+                    if pdf_val is None or excel_val is None:
+                        continue
+
+                    if pdf_val == excel_val:
+                        continue
+                        
+                    # It is a difference.
+                    diff = excel_val - pdf_val
+                    if excel_val == 2496 and pdf_val < 2496:
+                        status = "ℹ️ MinWage Correction"
+                    else:
+                        status = "❌ Mismatch"
+                            
+                    results.append({
+                        "Scale": s,
+                        "Period": p,
+                        "PDF Value": pdf_val,
+                        "Excel Value": excel_val,
+                        "Difference": diff,
+                        "Status": status
+                    })
+                
+                df_res = pd.DataFrame(results)
+                
+                if df_res.empty:
+                    st.success("✅ No Mismatches Found! (All values match or represent explained MinWage corrections)")
+                else:
+                    st.warning("⚠️ Mismatches Found (Including MinWage Corrections)")
+                    
+                    # Optional: metric summary
+                    # st.dataframe(df_res, use_container_width=True)
+                    
+                    # Let's show a clean table
+                    st.table(df_res)
+                
+            except Exception as e:
+                st.error(f"An error occurred: {e}")
+                st.exception(e)
     else:
-        st.success("Perfect Match! No discrepancies found.")
-
+        st.warning("Please upload both files to proceed.")
