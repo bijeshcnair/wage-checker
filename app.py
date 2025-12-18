@@ -11,15 +11,21 @@ st.markdown("Upload your **Salary Scale PDF** and the corresponding **Excel Shee
 
 # --- Parsing Logic ---
 
-def parse_pdf_with_geometry(pdf_file):
+def parse_pdf_with_geometry(pdf_file, page_num=1):
     data = {} # (period, scale) -> value
     
     with pdfplumber.open(pdf_file) as pdf:
         if len(pdf.pages) == 0:
             return data
-        page = pdf.pages[0]
+            
+        # Validate Page Num
+        if page_num < 1 or page_num > len(pdf.pages):
+            st.error(f"Page {page_num} not found. PDF has {len(pdf.pages)} pages.")
+            return {}
+            
+        page = pdf.pages[page_num - 1]
+        
         # Cluster words into lines based on 'top' coordinate with tolerance
-        # Standard clustering can be brittle. We group words that are vertically close.
         words = sorted(page.extract_words(), key=lambda w: (w['top'], w['x0']))
         
     lines = []
@@ -54,9 +60,6 @@ def parse_pdf_with_geometry(pdf_file):
             
         # Header detection
         if "Periodiek" in text_line:
-            # If we are active (or fallback if we missed the title but see Periodiek before July)
-            # We assume first Periodiek encountered before July is the one we want if active wasn't set 
-            # (but safer to rely on 'table_active' from date)
             if table_active:
                 scale_columns = {} 
                 seen_periodiek = False
@@ -68,9 +71,7 @@ def parse_pdf_with_geometry(pdf_file):
                         scale_name = w['text']
                         x_center = (w['x0'] + w['x1']) / 2
                         scale_columns[scale_name] = x_center
-            elif "1" in text_line and "2" in text_line: # Heuristic: if we see Periodiek and numbers, maybe it's the header
-                 # Only activate if we haven't started. 
-                 # But sticking to strict 'table_active' is safer to avoid confusing block headers.
+            elif "1" in text_line and "2" in text_line: 
                  pass
             continue
             
@@ -99,7 +100,7 @@ def parse_pdf_with_geometry(pdf_file):
                 w_center = (w['x0'] + w['x1']) / 2
                 
                 closest_scale = None
-                min_dist = 50 # Threshold
+                min_dist = 50 
                 
                 for scale, col_x in scale_columns.items():
                     dist = abs(w_center - col_x)
@@ -185,8 +186,12 @@ default_excel_exists = os.path.exists(default_excel_path)
 
 with col1:
     pdf_file = st.file_uploader("Upload PDF", type=["pdf"])
+    
     if not pdf_file and default_pdf_exists:
         st.info(f"Using default: {default_pdf_path}")
+        
+    # Page selector feature
+    page_num = st.number_input("PDF Page Number", min_value=1, value=1, step=1)
 
 with col2:
     excel_file = st.file_uploader("Upload Excel", type=["xlsx"])
@@ -201,7 +206,8 @@ if st.button("Compare Files"):
     if pdf_to_process and excel_to_process:
         with st.spinner("Parsing files..."):
             try:
-                pdf_data = parse_pdf_with_geometry(pdf_to_process)
+                # Pass page_num
+                pdf_data = parse_pdf_with_geometry(pdf_to_process, page_num=page_num)
                 excel_data = parse_excel_sheet(excel_to_process)
                 
                 # Comparison Logic
@@ -251,7 +257,10 @@ if st.button("Compare Files"):
                 df_res = pd.DataFrame(results)
                 
                 if df_res.empty:
-                    st.success("✅ No Mismatches Found! (All values match or represent explained MinWage corrections)")
+                    if not pdf_data:
+                         st.warning(f"No data found on Page {page_num}. Please check if the page contains a valid salary table.")
+                    else:
+                         st.success("✅ No Mismatches Found! (All values match or represent explained MinWage corrections)")
                 else:
                     st.warning("⚠️ Mismatches Found (Including MinWage Corrections)")
                     st.table(df_res)
